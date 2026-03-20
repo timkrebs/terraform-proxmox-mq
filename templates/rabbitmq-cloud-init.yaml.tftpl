@@ -1,0 +1,84 @@
+#cloud-config
+# RabbitMQ ${engine_version} – Cloud-Init for ${identifier}
+
+package_update: true
+
+packages:
+  - erlang-nox
+  - rabbitmq-server
+  - curl
+
+write_files:
+  # ── RabbitMQ configuration ──────────────────────────────────────────────────
+  - path: /etc/rabbitmq/rabbitmq.conf
+    owner: rabbitmq:rabbitmq
+    permissions: "0644"
+    content: |
+      ## Listeners
+      listeners.tcp.default = ${amqp_port}
+      management.tcp.port   = ${management_port}
+
+      ## Memory & disk thresholds
+      vm_memory_high_watermark.absolute = ${memory_limit_mb}MB
+      disk_free_limit.absolute          = 1GB
+
+      ## Logging
+      log.file.level = info
+
+  # ── Setup script ────────────────────────────────────────────────────────────
+  - path: /opt/mq/setup-rabbitmq.sh
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      echo ">>> Enabling RabbitMQ management plugin..."
+      rabbitmq-plugins enable rabbitmq_management
+
+      echo ">>> Restarting RabbitMQ to apply configuration..."
+      systemctl restart rabbitmq-server
+
+      echo ">>> Waiting for RabbitMQ to become ready..."
+      for i in $(seq 1 30); do
+        if rabbitmqctl await_startup 2>/dev/null; then
+          echo "    RabbitMQ is ready."
+          break
+        fi
+        echo "    Attempt $i/30 – waiting 2 s..."
+        sleep 2
+      done
+
+      echo ">>> Deleting default guest user..."
+      rabbitmqctl delete_user guest 2>/dev/null || true
+
+      echo ">>> Creating admin user '${admin_username}'..."
+      rabbitmqctl add_user '${admin_username}' '${admin_password}' 2>/dev/null || \
+        rabbitmqctl change_password '${admin_username}' '${admin_password}'
+      rabbitmqctl set_user_tags '${admin_username}' administrator
+
+      %{ if vhost != "/" ~}
+      echo ">>> Creating vhost '${vhost}'..."
+      rabbitmqctl add_vhost '${vhost}'
+      %{ endif ~}
+
+      echo ">>> Setting permissions for '${admin_username}' on '${vhost}'..."
+      rabbitmqctl set_permissions -p '${vhost}' '${admin_username}' '.*' '.*' '.*'
+
+      echo ">>> Configuring iptables firewall rules..."
+      %{ for cidr in allowed_cidrs ~}
+      iptables -A INPUT -p tcp --dport ${amqp_port} -s ${cidr} -j ACCEPT
+      iptables -A INPUT -p tcp --dport ${management_port} -s ${cidr} -j ACCEPT
+      %{ endfor ~}
+      # Drop all other traffic to AMQP and management ports
+      iptables -A INPUT -p tcp --dport ${amqp_port} -j DROP
+      iptables -A INPUT -p tcp --dport ${management_port} -j DROP
+
+      # Persist iptables rules if iptables-persistent is available
+      if command -v netfilter-persistent &>/dev/null; then
+        netfilter-persistent save
+      fi
+
+      echo ">>> RabbitMQ setup complete."
+
+runcmd:
+  - bash /opt/mq/setup-rabbitmq.sh
